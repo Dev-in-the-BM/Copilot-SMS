@@ -1,5 +1,5 @@
 // ========================================================================
-//      GroupMe Bot: Latency-Optimized Multi-Group Repeater (With Help Menu)
+//      GroupMe Bot: Latency-Optimized Multi-Group Repeater (Owner Verified)
 // ========================================================================
 
 const ACTUAL_COPILOT_USER_ID = "128934125";
@@ -12,6 +12,9 @@ const DEFAULT_SETTINGS = {
   botId: ""
 };
 
+// Global cache variable to avoid hitting GroupMe's /users/me endpoint on every single message
+var CACHED_OWNER_ID = null;
+
 function doPost(e) {
   if (!e || !e.postData || !e.postData.contents) return ContentService.createTextOutput("");
   
@@ -19,6 +22,7 @@ function doPost(e) {
     const postData = JSON.parse(e.postData.contents);
     const { group_id, user_id, text, sender_type } = postData;
     
+    // Drop execution immediately if sender is not a user, or if text is missing
     if (sender_type !== 'user' || user_id === ACTUAL_COPILOT_USER_ID || !text) {
       return ContentService.createTextOutput("");
     }
@@ -30,22 +34,26 @@ function doPost(e) {
     const messageTextLower = messageText.toLowerCase();
     const adminPrefixLower = settings.adminPrefix.toLowerCase();
     
-    // 2. ABSOLUTE GUARD FOR ADMIN COMMANDS
+    // 1. INTERCEPT ADMIN COMMANDS IMMEDIATELY
     if (messageTextLower.startsWith(adminPrefixLower)) {
-      const commandBody = messageText.substring(settings.adminPrefix.length).trim();
-      const commandBodyLower = commandBody.toLowerCase();
-      
-      if (commandBodyLower.startsWith("config ")) {
-        handleConfigCommand(group_id, commandBody, settings);
+      // SECURITY VERIFICATION: Only allow the true token owner to pass
+      if (verifyMessageSenderIsOwner(user_id)) {
+        const commandBody = messageText.substring(settings.adminPrefix.length).trim();
+        const commandBodyLower = commandBody.toLowerCase();
+        
+        if (commandBodyLower.startsWith("config ")) {
+          handleConfigCommand(group_id, commandBody, settings);
+        } else {
+          sendHelpMenu(settings);
+        }
       } else {
-        // Triggers if the user types just the prefix, a bad command, or explicitly asks for help
-        sendHelpMenu(settings);
+        Logger.log(`Unauthorized config attempt blocked from User ID: ${user_id}`);
       }
       
       return ContentService.createTextOutput(""); 
     }
     
-    // 3. FAST PATH REPEATER LOGIC
+    // 2. REPEATER ACTION PATHS
     let shouldRepeat = false;
     let cleanMessage = messageText;
     
@@ -58,9 +66,8 @@ function doPost(e) {
       cleanMessage = messageText.substring(settings.triggerPrefix.length).trim();
     }
     
-    // 4. PREPARE AND EXECUTE PAYLOAD ROUTING
+    // 3. EXECUTE ROUTING
     if (shouldRepeat && cleanMessage.length > 0) {
-      // Append custom prompt on its own line if one is configured
       if (settings.customPrompt && settings.customPrompt !== "") {
         cleanMessage += "\n" + settings.customPrompt;
       }
@@ -68,10 +75,41 @@ function doPost(e) {
     }
     
   } catch (error) {
-    Logger.log("Critical path processing error: " + error.message);
+    Logger.log("Processing flow exception: " + error.message);
   }
   
   return ContentService.createTextOutput("");
+}
+
+/**
+ * Validates whether the sender matching the user_id owns the provided developer token.
+ */
+function verifyMessageSenderIsOwner(incomingSenderId) {
+  if (CACHED_OWNER_ID !== null) {
+    return String(incomingSenderId) === String(CACHED_OWNER_ID);
+  }
+  
+  const userToken = PropertiesService.getScriptProperties().getProperty("GROUPME_USER_TOKEN");
+  if (!userToken) return false;
+  
+  try {
+    const response = UrlFetchApp.fetch(`https://api.groupme.com/v3/users/me?token=${userToken}`, {
+      method: "get",
+      muteHttpExceptions: true
+    });
+    
+    if (response.getResponseCode() === 200) {
+      const data = JSON.parse(response.getContentText());
+      if (data.response && data.response.id) {
+        CACHED_OWNER_ID = String(data.response.id);
+        return String(incomingSenderId) === String(CACHED_OWNER_ID);
+      }
+    }
+  } catch (err) {
+    Logger.log("Error querying self identity from GroupMe: " + err.message);
+  }
+  
+  return false;
 }
 
 function getGroupSettings(groupId) {
@@ -101,7 +139,7 @@ function handleConfigCommand(groupId, commandBodyCasePreserved, currentSettings)
   switch(key) {
     case "help":
       sendHelpMenu(currentSettings);
-      return; // Handled separately, exit out early
+      return;
       
     case "prompt":
       currentSettings.customPrompt = value;
@@ -133,30 +171,73 @@ function handleConfigCommand(groupId, commandBodyCasePreserved, currentSettings)
       
     case "bot_id":
       currentSettings.botId = value;
-      successMessage = `Group Bot ID linked successfully.`;
+      successMessage = `Group Bot ID linked successfully via direct assignment.`;
+      break;
+      
+    case "bot_name":
+      if (value === "") {
+        successMessage = "Error: You must provide a bot name to query. Example: !config bot_name MyBot";
+        updated = false;
+        break;
+      }
+      
+      const discoveredBotId = lookupBotIdByName(groupId, value);
+      if (discoveredBotId) {
+        currentSettings.botId = discoveredBotId;
+        // FIX: The success message has been edited to completely hide the bot_id hash
+        successMessage = `Success! Looked up and linked bot "${value}" for this chat group.`;
+      } else {
+        successMessage = `Error: Could not find any active bot named "${value}" configured for this specific group ID (${groupId}) inside your developer account.`;
+        updated = false;
+      }
       break;
       
     default:
-      // If the setting option itself is invalid, trigger the help menu response
-      sendHelpMenu(currentSettings, `Unknown setting "${key}".\n\n`);
+      sendHelpMenu(currentSettings, `Unknown option "${key}".\n\n`);
       return;
   }
   
   if (updated) saveGroupSettings(groupId, currentSettings);
   
-  if (currentSettings.botId) {
-    dispatchBotPost(currentSettings.botId, successMessage);
+  const activeBotId = currentSettings.botId;
+  if (activeBotId) {
+    dispatchBotPost(activeBotId, successMessage);
   }
 }
 
-/**
- * Sends a structured menu outlining available functionality via the linked bot ID.
- */
-function sendHelpMenu(settings, errorPrefix) {
-  if (!settings.botId) {
-    Logger.log("Help menu requested but no Bot ID is linked for this group.");
-    return;
+function lookupBotIdByName(groupId, targetName) {
+  const userToken = PropertiesService.getScriptProperties().getProperty("GROUPME_USER_TOKEN");
+  if (!userToken) return null;
+  
+  try {
+    const response = UrlFetchApp.fetch(`https://api.groupme.com/v3/bots?token=${userToken}`, {
+      method: "get",
+      muteHttpExceptions: true
+    });
+    
+    if (response.getResponseCode() !== 200) return null;
+    
+    const data = JSON.parse(response.getContentText());
+    if (!data.response) return null;
+    
+    for (let i = 0; i < data.response.length; i++) {
+      const botObj = data.response[i];
+      if (
+        botObj.name && botObj.name.trim().toLowerCase() === targetName.toLowerCase() &&
+        String(botObj.group_id) === String(groupId)
+      ) {
+        return botObj.bot_id;
+      }
+    }
+  } catch (err) {
+    Logger.log("API Query Error during Bot Name matching: " + err.message);
   }
+  
+  return null;
+}
+
+function sendHelpMenu(settings, errorPrefix) {
+  if (!settings.botId) return;
   
   const prefix = settings.adminPrefix;
   const errMsg = errorPrefix || "";
@@ -165,16 +246,18 @@ function sendHelpMenu(settings, errorPrefix) {
     `🤖 Copilot Repeater Config Menu\n` +
     `==============================\n` +
     `Available Commands:\n\n` +
+    `• ${prefix}config bot_name [name]\n` +
+    `  Finds & links the Bot ID from GroupMe using its exact name.\n\n` +
     `• ${prefix}config bot_id [id]\n` +
-    `  Links the GroupMe bot response profile.\n\n` +
+    `  Links the response profile directly using its hash ID.\n\n` +
     `• ${prefix}config prompt [text]\n` +
-    `  Appends custom instructions to a new line on every prompt.\n\n` +
+    `  Appends custom instructions onto a new line for Copilot prompts.\n\n` +
     `• ${prefix}config trigger_prefix [char]\n` +
-    `  Only repeats messages starting with [char]. Use "clear" to reset.\n\n` +
+    `  Filters traffic. Use "clear" to listen to all messages.\n\n` +
     `• ${prefix}config admin_prefix [char]\n` +
     `  Changes this configuration symbol.\n\n` +
     `• ${prefix}help\n` +
-    `  Displays this menu.`;
+    `  Displays this text map.`;
 
   dispatchBotPost(settings.botId, helpText);
 }
